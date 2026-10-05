@@ -661,6 +661,18 @@
                     </div>
                 </div>
 
+                <!-- Formato de fecha -->
+                <div class="sub-panel p-3 mb-6 flex flex-wrap items-center gap-x-4 gap-y-2">
+                    <i class="fa-regular fa-calendar text-[#2DD4BF]" aria-hidden="true"></i>
+                    <p id="dateFormatInfo" class="text-[13px] text-[#CBD5E1] flex-1 min-w-[240px]"></p>
+                    <label for="dateOrder" class="field-label !mb-0">Interpretar fechas como</label>
+                    <select id="dateOrder" class="input !w-auto !min-h-[34px] !py-1 !text-xs" onchange="setDateOrder(this.value)">
+                        <option value="auto">Automático</option>
+                        <option value="dmy">Día/mes/año</option>
+                        <option value="mdy">Mes/día/año</option>
+                    </select>
+                </div>
+
                 <!-- T.Conv -->
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     <div>
@@ -1144,8 +1156,35 @@
         function isNonWorking(day) { return isWeekendDay(day) || holidays.has(day); }
         function workingDays() { return daysArray.filter(d => !isNonWorking(d)); }
 
-        // FIX: las fechas en texto se interpretan como día/mes/año (formato español).
-        // Antes "05/09/2026" se leía como 9 de mayo.
+        // Orden de las fechas en texto: se detecta por archivo ('dmy' = día/mes/año, 'mdy' = mes/día/año)
+        let dateOrderSetting = 'auto';   // elección del usuario: auto | dmy | mdy
+        let detectedDateOrder = 'dmy';   // lo detectado en el archivo actual
+        const effectiveDateOrder = () => dateOrderSetting === 'auto' ? detectedDateOrder : dateOrderSetting;
+
+        // Mira todas las fechas de la columna: si algún primer número pasa de 12 es día/mes;
+        // si algún segundo número pasa de 12 es mes/día. Si no hay pistas, se asume formato español.
+        function analyzeDateColumn(values) {
+            let dmy = 0, mdy = 0, ymd = 0, serial = 0, dates = 0, text = 0, sample = '';
+            values.forEach(v => {
+                if (v === null || v === undefined || v === '') return;
+                if (v instanceof Date) { dates++; return; }
+                if (typeof v === 'number') { serial++; return; }
+                const s = String(v).trim();
+                if (!sample) sample = s;
+                text++;
+                let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+                if (m) { if (+m[1] > 12) dmy++; if (+m[2] > 12) mdy++; return; }
+                if (/^\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}/.test(s)) ymd++;
+            });
+            const order = (mdy > 0 && dmy === 0) ? 'mdy' : 'dmy';
+            let label;
+            if (ymd && ymd >= text / 2) label = 'año/mes/día' + (/\d:\d\d/.test(sample) ? ' con hora' : '');
+            else if (text) label = (order === 'mdy' ? 'mes/día/año (formato EE. UU.)' : 'día/mes/año') + (/\d:\d\d/.test(sample) ? ' con hora' : '') + (!dmy && !mdy ? ' · no hay días mayores de 12, se asume día/mes' : '');
+            else if (dates || serial) label = 'fecha de Excel (sin ambigüedad)';
+            else label = 'no reconocido';
+            return { order, label, sample, conflict: dmy > 0 && mdy > 0 };
+        }
+
         function parseDateValue(val) {
             if (val === null || val === undefined) return null;
             if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
@@ -1160,8 +1199,10 @@
                 let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
                 if (m) {
                     let y = +m[3]; if (y < 100) y += 2000;
-                    const d = new Date(y, +m[2] - 1, +m[1]);
-                    return (d.getMonth() === +m[2] - 1 && d.getDate() === +m[1]) ? d : null;
+                    const mdy = effectiveDateOrder() === 'mdy';
+                    const day = mdy ? +m[2] : +m[1], mon = mdy ? +m[1] : +m[2];
+                    const d = new Date(y, mon - 1, day);
+                    return (d.getMonth() === mon - 1 && d.getDate() === day) ? d : null;
                 }
                 m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
                 if (m) {
@@ -1373,8 +1414,13 @@
             catch (e) { return new TextDecoder('windows-1252').decode(buffer); }
         }
         function readWorkbook(buffer, file, opts = {}) {
-            if (/\.csv$/i.test(file.name)) {
-                // raw: los textos se mantienen tal cual (las fechas dd/mm/aaaa no se reinterpretan como mm/dd)
+            // Un .xlsx real empieza por "PK" (zip) y un .xls clásico por D0 CF 11 E0.
+            // Cualquier otra cosa es texto: CSV o una tabla HTML guardada como .xls (exportaciones de centralitas).
+            const b = new Uint8Array(buffer.slice(0, 4));
+            const isZip = b[0] === 0x50 && b[1] === 0x4B;
+            const isOle = b[0] === 0xD0 && b[1] === 0xCF && b[2] === 0x11 && b[3] === 0xE0;
+            if (/\.csv$/i.test(file.name) || (!isZip && !isOle)) {
+                // raw: los textos se mantienen tal cual, sin que la librería reinterprete las fechas
                 return XLSX.read(decodeCsv(buffer), { type: 'string', raw: true });
             }
             return XLSX.read(buffer, { type: 'array', ...opts });
@@ -1481,14 +1527,20 @@
                 nifColumnSelect.add(new Option(header, header));
             });
 
+            let dateScore = 0, tconvScore = 0;
             headers.forEach(header => {
                 if (!header) return;
                 const hStr = String(header).trim();
-                const h = hStr.toLowerCase();
-                if (h.includes('fecha') || h.includes('dia') || h.includes('date') || h.includes('time')) dateColumnSelect.value = hStr;
+                const h = hStr.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+                const ds = h.includes('fecha') ? 3 : (h.includes('date') ? 2 : ((/\bdia\b/.test(h) || h.includes('time')) && !h.includes('tiempo') ? 1 : 0));
+                if (ds > dateScore) { dateScore = ds; dateColumnSelect.value = hStr; }
                 if (h.includes('agente') || h.includes('nombre') || h.includes('user') || h.includes('operador')) agentColumnSelect.value = hStr;
                 if (h.includes('desc') || h.includes('detalle') || h.includes('motivo') || h.includes('comentario') || h.includes('observaci')) descSelect.value = hStr;
-                if (h.includes('t.conv') || h.includes('tconv') || h.includes('conversacion') || h.includes('duracion') || h.includes('minuto') || h.includes('tiempo')) tconvColumnSelect.value = hStr;
+                // TMO: prioridad a "conversación / T.Conv / duración"; nunca "tiempo de cola / espera / timbre"
+                if (!/cola|espera|ring|timbre|wait|queue/.test(h)) {
+                    const ts = (h.includes('t.conv') || h.includes('tconv') || h.includes('conversacion') || h.includes('hablado') || h.includes('talk')) ? 3 : h.includes('duracion') ? 2 : (h.includes('minuto') || h.includes('tiempo')) ? 1 : 0;
+                    if (ts > tconvScore) { tconvScore = ts; tconvColumnSelect.value = hStr; }
+                }
             });
 
             // FIX: antes "id" también encontraba "apellIDo" y tomaba el nombre como NIF
@@ -1509,33 +1561,36 @@
                 setIf(tconvColumnSelect, cfg.map.tconv);
             }
 
-            let bestDateCol = dateColumnSelect.value;
-            let defaultYM = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
-
-            if (bestDateCol && currentSheetData && currentSheetData.length > 0) {
-                const monthCounts = {};
-                currentSheetData.forEach(row => {
-                    const d = parseDateValue(row[bestDateCol]);
-                    if (d) {
-                        const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-                        monthCounts[ym] = (monthCounts[ym] || 0) + 1;
-                    }
-                });
-
-                let maxCount = 0;
-                for (const [ym, count] of Object.entries(monthCounts)) {
-                    if (count > maxCount) {
-                        maxCount = count;
-                        defaultYM = ym;
-                    }
-                }
-            }
-            monthPicker.value = defaultYM;
+            refreshDateFormat();
+            dateColumnSelect.onchange = refreshDateFormat;
 
             step1.classList.add('hidden');
             step2.classList.remove('hidden');
             setStep(2);
         }
+
+        // Analiza la columna de fechas elegida, muestra el formato detectado y propone el mes con más llamadas
+        function refreshDateFormat() {
+            const col = dateColumnSelect.value;
+            const info = document.getElementById('dateFormatInfo');
+            if (!col || !currentSheetData.length) { info.textContent = ''; return; }
+            const a = analyzeDateColumn(currentSheetData.map(r => r[col]));
+            detectedDateOrder = a.order;
+            const forced = dateOrderSetting !== 'auto';
+            info.innerHTML = `Formato detectado: <strong>${esc(a.label)}</strong>${a.sample ? ` · ej. <span class="mono">${esc(a.sample)}</span>` : ''}` +
+                (a.conflict ? ` · <span class="text-[#F5A524]">el archivo mezcla formatos; revisa el resultado</span>` : '') +
+                (forced ? ` · <span class="text-[#2DD4BF]">usando ${dateOrderSetting === 'mdy' ? 'mes/día/año' : 'día/mes/año'} (elegido a mano)</span>` : '');
+            const monthCounts = {};
+            currentSheetData.forEach(row => {
+                const d = parseDateValue(row[col]);
+                if (d) { const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; monthCounts[ym] = (monthCounts[ym] || 0) + 1; }
+            });
+            let best = null, max = 0;
+            for (const [ym, n] of Object.entries(monthCounts)) if (n > max) { max = n; best = ym; }
+            if (best) monthPicker.value = best;
+            else if (!monthPicker.value) monthPicker.value = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+        }
+        function setDateOrder(v) { dateOrderSetting = v; refreshDateFormat(); }
 
         // ---------- Procesamiento ----------
         function parseNumericMinutes(val) {
@@ -2138,6 +2193,7 @@
             unmatchedTempCounts = {}; unmatchedTempDescriptions = {}; unmatchedTempTConv = {}; unmatchedTempTConvByDay = {};
             unmatchedTempTotal = 0; matchLog = {};
             callMeta = {}; callMetaKeys = new Set(); callMetaHasTime = false; findingsFilter = 'todos';
+            dateOrderSetting = 'auto'; document.getElementById('dateOrder').value = 'auto';
             destroyCharts();
             currentSelectedAgent = null;
 
